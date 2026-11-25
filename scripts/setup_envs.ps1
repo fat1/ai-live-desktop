@@ -196,7 +196,8 @@ if ($Only -in 'all', 'cosyvoice') {
         # openai-whisper's setup.py imports pkg_resources, which setuptools 81+ no longer ships.
         $constraints = "$Root\downloads\build_constraints.txt"
         Set-Content -Encoding ascii $constraints 'setuptools<81'
-        & $Uv pip install --python $Py -r $req --build-constraints $constraints `
+        # 'setuptools<81' is also needed at run time: CosyVoice imports pkg_resources.
+        & $Uv pip install --python $Py -r $req 'setuptools<81' --build-constraints $constraints `
             --index https://download.pytorch.org/whl/cu121 --index-strategy unsafe-best-match
     }
     Invoke-Step 'cosyvoice_model' {

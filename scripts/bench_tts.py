@@ -52,6 +52,7 @@ def main() -> None:
     parser.add_argument("--ref_lang", default="zh", help="参考音频的语言：zh 或 en")
     parser.add_argument("--version", default="v2ProPlus")
     parser.add_argument("--out_dir", required=True)
+    parser.add_argument("--sentences", help="每行一句的文本文件；不给则用内置句子")
     parser.add_argument("--repeat", type=int, default=1, help="句子列表重复合成的次数，并发测试时调大")
     args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -101,13 +102,17 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats()
     print("idx | chars | audio s | synth s |  RTF")
     total_audio = total_time = 0.0
-    for index, text in enumerate(SENTENCES * args.repeat):
+    sentences = SENTENCES
+    if args.sentences:
+        with open(args.sentences, encoding="utf-8") as f:
+            sentences = [line.strip() for line in f if line.strip()]
+    for index, text in enumerate(sentences * args.repeat):
         rate, audio, elapsed = synthesize(text)
         seconds = len(audio) / rate
         total_audio += seconds
         total_time += elapsed
-        if index < len(SENTENCES):
-            sf.write(os.path.join(args.out_dir, f"{args.version}_{index}.wav"), audio, rate)
+        if index < len(sentences):
+            sf.write(os.path.join(args.out_dir, f"gptsovits_{args.version}_{index}.wav"), audio, rate)
         print(f"{index:3d} | {len(text):5d} | {seconds:7.2f} | {elapsed:7.2f} | {elapsed / seconds:4.2f}", flush=True)
     print(f"total: {total_audio:.1f}s audio in {total_time:.1f}s, RTF {total_time / total_audio:.2f}")
     print(f"peak alloc: {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB, "

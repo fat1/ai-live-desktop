@@ -36,9 +36,30 @@ class Avatar:
     frames: list[np.ndarray]       # 原始帧，BGR
     masks: list[np.ndarray]        # 融合遮罩，单通道
     mask_coords: list              # 每帧遮罩裁剪框
+    sharpen: float = 0.0           # 生成区域的锐化强度
 
     def __len__(self) -> int:
         return len(self.frames)
+
+
+def _mouth_mask(mask: np.ndarray, face_box: tuple, crop_box: tuple) -> np.ndarray:
+    """把融合遮罩收窄到嘴和下巴一带。
+
+    参数:
+        mask: MuseTalk 预处理生成的遮罩（覆盖整个下半张脸），大小等于裁剪框
+        face_box: 人脸框 (x1, y1, x2, y2)，整帧坐标
+        crop_box: 遮罩对应的裁剪框，整帧坐标
+    返回:
+        收窄后的遮罩，边缘羽化
+    """
+    x1, y1, x2, y2 = face_box
+    width, height = x2 - x1, y2 - y1
+    # 嘴的中心大约在人脸框高度的 80% 处；椭圆从鼻子下方盖到下巴，左右留出脸颊
+    center = (round((x1 + x2) / 2 - crop_box[0]), round(y1 + 0.80 * height - crop_box[1]))
+    ellipse = np.zeros_like(mask)
+    cv2.ellipse(ellipse, center, (round(0.34 * width), round(0.22 * height)), 0, 0, 360, 255, -1)
+    ellipse = cv2.GaussianBlur(ellipse, (0, 0), 0.04 * width)
+    return (mask.astype(np.uint16) * ellipse // 255).astype(np.uint8)
 
 
 class LipSyncEngine:
@@ -111,9 +132,14 @@ class LipSyncEngine:
             self._audio.get_whisper_chunk(features, self.device, self.dtype, self._whisper, length, fps=self.fps,
                                           audio_padding_length_left=2, audio_padding_length_right=2)
 
-    def load_avatar(self, avatar_dir: str | Path) -> Avatar:
+    def load_avatar(self, avatar_dir: str | Path, mouth_only: bool = True, sharpen: float = 0.6) -> Avatar:
         """读取预处理好的素材目录。
 
+        参数:
+            avatar_dir: MuseTalk 预处理输出的素材目录
+            mouth_only: 只替换嘴和下巴一带，脸颊和鼻子保留原始画面。模型输出只有 256x256，
+                贴回大脸时要放大，替换范围越大，模糊的区域越明显
+            sharpen: 对放大后的生成区域做锐化的强度，0 表示不锐化
         抛出:
             FileNotFoundError: 目录不完整
         """
@@ -129,12 +155,16 @@ class LipSyncEngine:
         with open(avatar_dir / "mask_coords.pkl", "rb") as f:
             mask_coords = pickle.load(f)
         latents = torch.cat(torch.load(avatar_dir / "latents.pt", map_location="cpu"))
+        masks = [mask[:, :, 0] for mask in read_sorted("mask")]
+        if mouth_only:
+            masks = [_mouth_mask(mask, box, crop) for mask, box, crop in zip(masks, coords, mask_coords)]
         return Avatar(
             latents=latents.to(self.device, self.dtype),
             coords=coords,
             frames=read_sorted("full_imgs"),
-            masks=[mask[:, :, 0] for mask in read_sorted("mask")],
+            masks=masks,
             mask_coords=mask_coords,
+            sharpen=sharpen,
         )
 
     @torch.no_grad()
@@ -201,7 +231,12 @@ class LipSyncEngine:
         cx0, cy0, cx1, cy1 = max(xs, 0), max(ys, 0), min(xe, width), min(ye, height)
         region = frame[cy0:cy1, cx0:cx1]
         face_large = region.copy()
-        face_large[y1 - cy0:y2 - cy0, x1 - cx0:x2 - cx0] = cv2.resize(face, (x2 - x1, y2 - y1))
+        # 256x256 的输出要放大到人脸框大小，用 Lanczos 插值比默认的双线性清晰
+        enlarged = cv2.resize(face, (x2 - x1, y2 - y1), interpolation=cv2.INTER_LANCZOS4)
+        if avatar.sharpen > 0:
+            soft = cv2.GaussianBlur(enlarged, (0, 0), 2.0)
+            enlarged = cv2.addWeighted(enlarged, 1 + avatar.sharpen, soft, -avatar.sharpen, 0)
+        face_large[y1 - cy0:y2 - cy0, x1 - cx0:x2 - cx0] = enlarged
         mask = avatar.masks[index][cy0 - ys:cy1 - ys, cx0 - xs:cx1 - xs, None].astype(np.uint16)
         region[:] = ((face_large.astype(np.uint16) * mask + region.astype(np.uint16) * (255 - mask) + 127) // 255
                      ).astype(np.uint8)
