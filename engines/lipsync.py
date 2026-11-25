@@ -80,9 +80,10 @@ def _skin_detail(frame: np.ndarray, face_box: tuple) -> np.ndarray:
     x1, y1, x2, y2 = face_box
     width, height = x2 - x1, y2 - y1
     box = frame[y1:y2, x1:x2].astype(np.float32)
-    detail = box - cv2.GaussianBlur(box, (0, 0), 2.0)
+    # 模糊半径决定叠回多粗的细节：2 只有毛孔，7 左右能带回胡茬和细纹（对比图见技术方案）
+    detail = box - cv2.GaussianBlur(box, (0, 0), 7.0)
     weight = np.ones((height, width), np.float32)
-    cv2.ellipse(weight, (width // 2, round(0.78 * height)), (round(0.27 * width), round(0.10 * height)),
+    cv2.ellipse(weight, (width // 2, round(0.78 * height)), (round(0.20 * width), round(0.06 * height)),
                 0, 0, 360, 0.0, -1)
     weight = cv2.GaussianBlur(weight, (0, 0), 8.0)[:, :, None]
     return np.clip(detail * weight, -127, 127).astype(np.int8)

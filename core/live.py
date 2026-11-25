@@ -86,8 +86,9 @@ def main() -> None:
     parser.add_argument("--max_wait", type=float, default=15.0, help="弹幕等待超过这么多秒还没轮到就放弃")
     parser.add_argument("--out", required=True, help="录制输出的 mp4 路径")
     parser.add_argument("--avatar", required=True, help="MuseTalk 预处理好的素材目录")
-    parser.add_argument("--closed_mouth", action="store_true",
-                        help="待机时用闭嘴画面。素材视频里的人一直在说话时需要打开")
+    parser.add_argument("--original_idle", action="store_true",
+                        help="待机时直接播素材原始帧。默认待机也用模型生成的闭嘴画面：这样待机和说话时的嘴出自"
+                             "同一来源，切换时看不出变化；原始帧更清晰，但一开口嘴的样子会突变")
     parser.add_argument("--persona_file", help="人设文件，内容作为大模型的系统提示词")
     parser.add_argument("--ref_audio", help="声音克隆的参考音频")
     parser.add_argument("--ref_text", help="参考音频的文本")
@@ -132,7 +133,7 @@ def main() -> None:
     enhance_weights = root / "models/sr/realesr-general-x4v3.pth"
     lipsync = LipSyncEngine(root / "repos/MuseTalk", batch_size=args.batch_size,
                             enhance_weights=None if args.no_enhance else enhance_weights)
-    avatar = lipsync.load_avatar(Path(args.avatar).resolve(), closed_mouth=args.closed_mouth)
+    avatar = lipsync.load_avatar(Path(args.avatar).resolve(), closed_mouth=not args.original_idle)
     for loader in loaders:
         loader.join()
     peak_memory = gpu_memory_used()
