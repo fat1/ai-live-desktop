@@ -85,7 +85,7 @@ class LipSyncEngine:
         self._timesteps = torch.tensor([0], device=self.device)
 
         # 各阶段累计耗时（秒），用于性能分析
-        self.stats = {"audio_feature": 0.0, "model": 0.0, "blend": 0.0}
+        self.stats = {"audio_feature": 0.0, "model": 0.0}
         if use_compile:
             self._unet = torch.compile(self._unet)
             self._vae.decoder = torch.compile(self._vae.decoder)
@@ -128,15 +128,17 @@ class LipSyncEngine:
         )
 
     @torch.no_grad()
-    def render(self, avatar: Avatar, audio_path: str | Path, start_index: int = 0) -> Iterator[np.ndarray]:
-        """按音频生成说话的画面。
+    def render_faces(self, avatar: Avatar, audio_path: str | Path,
+                     start_index: int = 0) -> Iterator[tuple[int, np.ndarray]]:
+        """按音频生成说话的人脸（只做显卡推理，不做融合）。
 
         参数:
             avatar: 人物素材
             audio_path: 语音文件
             start_index: 从素材的第几帧开始，用于和上一段画面衔接
         返回:
-            逐帧产出 BGR 整帧图像；帧数为 floor(音频秒数 * fps)
+            逐帧产出 (素材帧序号, 人脸图像)；帧数为 floor(音频秒数 * fps)。
+            把结果交给 blend 即得到整帧画面，blend 可以放在别的线程里执行
         """
         started = time.perf_counter()
         features, length = self._audio.get_audio_feature(str(audio_path), weight_dtype=self.dtype)
@@ -163,11 +165,15 @@ class LipSyncEngine:
             image = ((image / 2 + 0.5).clamp(0, 1) * 255).round().to(torch.uint8)
             faces = image.permute(0, 2, 3, 1).flip(-1)[:real].cpu().numpy()  # RGB 转 BGR
             self.stats["model"] += time.perf_counter() - started
-            for index, face in zip(indices, faces):
-                started = time.perf_counter()
-                frame = self._blend(avatar, index, face)
-                self.stats["blend"] += time.perf_counter() - started
-                yield frame
+            yield from zip(indices, faces)
+
+    def render(self, avatar: Avatar, audio_path: str | Path, start_index: int = 0) -> Iterator[np.ndarray]:
+        """按音频生成说话的画面，逐帧产出融合好的 BGR 整帧图像。
+
+        生成和融合在同一线程里串行执行；需要并行时改用 render_faces 加 blend。
+        """
+        for index, face in self.render_faces(avatar, audio_path, start_index):
+            yield self.blend(avatar, index, face)
 
     @staticmethod
     def idle(avatar: Avatar, start_index: int, count: int) -> Iterator[np.ndarray]:
@@ -176,7 +182,7 @@ class LipSyncEngine:
             yield avatar.frames[(start_index + k) % len(avatar)]
 
     @staticmethod
-    def _blend(avatar: Avatar, index: int, face: np.ndarray) -> np.ndarray:
+    def blend(avatar: Avatar, index: int, face: np.ndarray) -> np.ndarray:
         """把生成的人脸贴回原始帧，只在人脸裁剪框内做融合。"""
         x1, y1, x2, y2 = avatar.coords[index]
         xs, ys, xe, ye = avatar.mask_coords[index]

@@ -57,6 +57,14 @@ class VoiceCloner:
             "cnhuhbert_base_path": f"{base}/chinese-hubert-base",
         }}))
 
+    def warm_up(self, voice: Voice) -> None:
+        """用指定音色先合成一句短话。
+
+        首次合成要处理参考音频并初始化各子模型，实测约 16 秒；放在加载阶段做，
+        开播后的第一句话就不会卡顿。
+        """
+        self.synthesize("你好，欢迎来到直播间。", voice)
+
     def synthesize(self, text: str, voice: Voice, text_lang: str = "zh") -> tuple[int, np.ndarray]:
         """合成一句话。
 

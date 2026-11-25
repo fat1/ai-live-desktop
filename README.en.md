@@ -1,6 +1,6 @@
 [简体中文](README.md) | **English**
 
-# AI Avatar Live Assistant (ai-live-desktop)
+# AI Avatar Live Assistant (ai-live-local)
 
 Turn your own video and voice into a talking digital host that runs entirely on your own PC.
 
