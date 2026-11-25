@@ -8,6 +8,7 @@
 
 import multiprocessing
 import os
+import queue
 import sys
 import traceback
 from collections.abc import Callable
@@ -54,7 +55,12 @@ def _worker(factory: Callable[[], Callable[[str], tuple[int, np.ndarray]]], ffmp
             if text is None:  # 标记请求：原样送回，调用方用它判断一批句子是否处理完
                 responses.put(("mark", key, None, None))
                 continue
-            sample_rate, audio = synthesize(text)
+            try:
+                sample_rate, audio = synthesize(text)
+            except Exception:
+                # 单句失败（例如文本无法转成音素）不应该让整个进程退出
+                responses.put(("skipped", key, None, traceback.format_exc()))
+                continue
             responses.put(("audio", key, sample_rate, audio))
     except Exception:
         responses.put(("error", traceback.format_exc(), None, None))
@@ -96,15 +102,26 @@ class TtsProcess:
         """提交一句要合成的话；text 为 None 时提交一个标记，会按顺序原样返回。"""
         self._requests.put((key, text))
 
-    def result(self) -> tuple[str, object, int | None, np.ndarray | None]:
+    def result(self, timeout: float = 120.0) -> tuple[str, object, int | None, object]:
         """取下一个结果，阻塞直到有结果。
 
         返回:
-            ("audio", key, 采样率, 音频) 或 ("mark", key, None, None)
+            ("audio", key, 采样率, 音频)、("mark", key, None, None)，
+            或 ("skipped", key, None, 出错信息)，表示这一句合成失败、已跳过
         抛出:
-            RuntimeError: 子进程里合成出错
+            RuntimeError: 子进程加载模型失败、已退出，或超过 timeout 秒没有返回
         """
-        kind, key, sample_rate, audio = self._responses.get()
+        waited = 0.0
+        while True:
+            try:
+                kind, key, sample_rate, audio = self._responses.get(timeout=1.0)
+                break
+            except queue.Empty:
+                waited += 1.0
+                if not self._process.is_alive():
+                    raise RuntimeError("语音合成进程已退出") from None
+                if waited >= timeout:
+                    raise RuntimeError(f"语音合成超过 {timeout:.0f} 秒没有返回") from None
         if kind == "error":
             raise RuntimeError(f"语音合成出错:\n{key}")
         return kind, key, sample_rate, audio

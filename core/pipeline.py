@@ -39,6 +39,11 @@ SYSTEM_PROMPT = (
 FPS = 25
 SENTENCE_END = re.compile(r"[。！？!?；;\n]")
 CLAUSE_END = re.compile(r"[。！？!?；;\n，,、：:]")
+MAX_SENTENCE_CHARS = 40
+BRACKETED = re.compile(r"[（(\[【<][^）)\]】>]{0,30}[）)\]】>]")
+# 只保留中文、字母、数字和常用标点，其余（表情、星号、井号等）一律去掉
+UNSPEAKABLE = re.compile(r"[^一-鿿A-Za-z0-9\s，。！？、；：,.!?;:%％·\-—…\"“”'‘’]")
+SPEAKABLE = re.compile(r"[一-鿿A-Za-z0-9]")
 
 
 def stream_sentences(deltas: Iterable[str], min_chars: int = 6, first_clause: bool = True) -> Iterator[str]:
@@ -56,6 +61,11 @@ def stream_sentences(deltas: Iterable[str], min_chars: int = 6, first_clause: bo
     for delta in deltas:
         buffer += delta
         search_from = 0
+        while len(buffer) > MAX_SENTENCE_CHARS and pattern.search(buffer) is None:
+            # 一直不出现标点时按字数强制切开，避免缓冲无限增长
+            yield buffer[:MAX_SENTENCE_CHARS]
+            buffer = buffer[MAX_SENTENCE_CHARS:]
+            pattern = SENTENCE_END
         while (match := pattern.search(buffer, search_from)) is not None:
             if match.end() >= min_chars:
                 sentence = buffer[:match.end()].strip()
@@ -68,6 +78,32 @@ def stream_sentences(deltas: Iterable[str], min_chars: int = 6, first_clause: bo
                 search_from = match.end()
     if buffer.strip():
         yield buffer.strip()
+
+
+def clean_for_speech(text: str) -> str:
+    """去掉不该念出来的内容：括号里的说明、表情和各种标记符号。
+
+    小模型不一定遵守提示词里"不要用表情和括号"的要求，送去合成前再清洗一遍。
+
+    返回:
+        清洗后的文本；如果没有剩下可念的字（例如只有标点或表情），返回空字符串
+    """
+    text = BRACKETED.sub("", text)
+    text = UNSPEAKABLE.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if SPEAKABLE.search(text) else ""
+
+
+def pad_to_whole_frames(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    """在句尾补静音，使音频时长略大于整数帧。
+
+    口型帧数按音频时长向下取整。不补的话，句尾不足一帧的尾音会在对齐时被裁掉。
+    多补 10 毫秒是为了抵消重采样的取整误差，保证取整后不少一帧。
+    """
+    samples_per_frame = sample_rate / FPS
+    frames = int(np.ceil(len(audio) / samples_per_frame))
+    target = round(frames * samples_per_frame) + sample_rate // 100
+    return np.concatenate([audio, np.zeros(target - len(audio), dtype=audio.dtype)])
 
 
 def fit_audio(audio: np.ndarray, sample_rate: int, frame_count: int) -> np.ndarray:
@@ -102,6 +138,7 @@ def main() -> None:
                         help="不说话时的画面：original 播放素材原始帧，closed_mouth 用静音驱动口型让嘴闭合")
     parser.add_argument("--persona_file", help="人设文件，内容作为大模型的系统提示词；不给则用内置的带货主播人设")
     parser.add_argument("--llm_context", type=int, default=2048)
+    parser.add_argument("--llm_gpu_layers", type=int, default=99, help="大模型放到显卡上的层数，0 表示纯 CPU")
     parser.add_argument("--preset_voice", help="使用预置音色（不做声音克隆），给出音色名，例如 zf_001")
     parser.add_argument("--tts_parallel", action="store_true", help="开启 GPT-SoVITS 的并行推理")
     parser.add_argument("--no_first_clause", action="store_true", help="第一句不按逗号提前切分")
@@ -129,7 +166,7 @@ def main() -> None:
     tts = TtsProcess(factory, ffmpeg_dir)
     temperature = 0.0 if args.deterministic else 0.7
     llm = LlmServer(root / "tools/llama_cuda", root / "models/llm/Qwen3-4B-Q4_K_M.gguf",
-                    context_size=args.llm_context)
+                    context_size=args.llm_context, gpu_layers=args.llm_gpu_layers)
     # 三个模型的加载互不依赖：语音在子进程里加载，大模型是外部进程，本进程同时加载口型
     loaders = [threading.Thread(target=tts.start), threading.Thread(target=llm.start)]
     for loader in loaders:
@@ -217,6 +254,9 @@ def main() -> None:
                 try:
                     for sentence in stream_sentences(llm.chat_stream(system_prompt, message, temperature=temperature),
                                                      first_clause=not args.no_first_clause):
+                        sentence = clean_for_speech(sentence)
+                        if not sentence:
+                            continue
                         marks.setdefault("first_sentence", time.perf_counter())
                         reply_sentences.append(sentence)
                         tts.submit(number, sentence)
@@ -233,8 +273,12 @@ def main() -> None:
                     raise errors[0]
                 if kind == "mark":
                     break
+                if kind == "skipped":  # 这一句合成失败，跳过它继续播后面的
+                    print(f"    skipped one sentence: {str(audio).strip().splitlines()[-1]}", flush=True)
+                    continue
                 marks.setdefault("first_audio", time.perf_counter())
                 sample_rate = rate
+                audio = pad_to_whole_frames(audio, rate)
                 sf.write(sentence_wav, audio, rate)
                 frame_count = 0
                 for index, face in lipsync.render_faces(avatar, sentence_wav, start_index=cursor):
@@ -248,7 +292,7 @@ def main() -> None:
             flush_frames()
             peak_memory = max(peak_memory, gpu_memory_used())
 
-            if ready_times:
+            if ready_times and "first_audio" in marks:
                 offsets = [moment - arrival for moment in ready_times]
                 metrics.append({
                     "first_sentence": marks["first_sentence"] - arrival,
