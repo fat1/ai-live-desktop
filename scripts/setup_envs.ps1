@@ -120,7 +120,8 @@ if ($Only -in 'all', 'sovits') {
             Set-Content -Encoding ascii $req
         & $Uv pip install --python $Py --no-deps -r "$Repo\extra-req.txt"
         if ($LASTEXITCODE -ne 0) { throw 'extra-req' }
-        & $Uv pip install --python $Py -r $req `
+        # resampy is imported by TTS_infer_pack but missing from upstream requirements.
+        & $Uv pip install --python $Py -r $req resampy `
             --index https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
     }
     Invoke-Step 'sovits_pretrained' {
