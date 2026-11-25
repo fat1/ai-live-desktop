@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+.claude/
+
+# 模型权重、素材与缓存不入库
+models/
+assets/
+cache/
+*.pth
+*.ckpt
+*.safetensors
+*.gguf
+*.onnx
+*.mp4
+*.wav
+
+build/
+dist/
