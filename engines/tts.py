@@ -20,6 +20,10 @@ import numpy as np
 # 合成函数：给一句文本，逐块产出 (采样率, int16 单声道音频)
 SynthesizeStream = Callable[[str], Iterator[tuple[int, np.ndarray]]]
 
+# 预热用的句子要同时包含中文、英文和数字：英文发音和数字读法各有自己的模块，
+# 都是第一次用到时才加载。只用纯中文预热的话，直播中第一次出现英文单词会卡几秒（实测 6.8 秒）
+WARM_UP_TEXT = "你好，欢迎来到直播间，今天聊聊AI和5G，现在是2026年。"
+
 
 @dataclass
 class Voice:
@@ -47,7 +51,7 @@ def make_clone_engine(sovits_root: str, voice: "Voice", version: str = "v2ProPlu
 def make_preset_engine(model_dir: str, voice_name: str = "zf_001", speed: float = 1.0) -> SynthesizeStream:
     """加载预置音色引擎并预热，返回合成函数。在语音子进程里调用。"""
     preset = PresetTts(model_dir, voice_name, speed)
-    preset.synthesize("你好，欢迎来到直播间。")
+    preset.synthesize(WARM_UP_TEXT)
     return lambda text: iter([preset.synthesize(text)])
 
 
@@ -187,8 +191,8 @@ class VoiceCloner:
         首次合成要处理参考音频并初始化各子模型，实测约 16 秒；放在加载阶段做，
         开播后的第一句话就不会卡顿。
         """
-        self.synthesize("你好，欢迎来到直播间。", voice)
-        for _ in self.stream("你好，欢迎来到直播间。", voice):
+        self.synthesize(WARM_UP_TEXT, voice)
+        for _ in self.stream(WARM_UP_TEXT, voice):
             pass
 
     def _request(self, text: str, voice: Voice, text_lang: str) -> dict:
