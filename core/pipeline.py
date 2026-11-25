@@ -98,6 +98,9 @@ def main() -> None:
     parser.add_argument("--no_compile", action="store_true", help="不使用 torch.compile")
     parser.add_argument("--pause", type=float, default=0.4, help="句间停顿秒数")
     parser.add_argument("--gap", type=float, default=1.0, help="两条回复之间的待机秒数")
+    parser.add_argument("--idle", choices=["original", "closed_mouth"], default="closed_mouth",
+                        help="不说话时的画面：original 播放素材原始帧，closed_mouth 用静音驱动口型让嘴闭合")
+    parser.add_argument("--persona_file", help="人设文件，内容作为大模型的系统提示词；不给则用内置的带货主播人设")
     parser.add_argument("--llm_context", type=int, default=2048)
     parser.add_argument("--preset_voice", help="使用预置音色（不做声音克隆），给出音色名，例如 zf_001")
     parser.add_argument("--tts_parallel", action="store_true", help="开启 GPT-SoVITS 的并行推理")
@@ -113,6 +116,7 @@ def main() -> None:
     out_path = Path(args.out).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     danmaku = [line.strip() for line in Path(args.danmaku).read_text(encoding="utf-8").splitlines() if line.strip()]
+    system_prompt = Path(args.persona_file).read_text(encoding="utf-8").strip() if args.persona_file else SYSTEM_PROMPT
 
     print(f"gpu memory before loading: {gpu_memory_used()} MiB", flush=True)
     load_start = time.perf_counter()
@@ -178,6 +182,29 @@ def main() -> None:
     sample_rate = 32000
     cursor = 0  # 素材帧游标，保证各段画面连续
     pause_frames = round(args.pause * FPS)
+    silence_wav = out_path.with_suffix(".silence.wav")
+
+    def emit_idle(count: int) -> None:
+        """输出 count 帧不说话的画面，并推进素材帧游标。
+
+        素材视频里的人如果本来在说话，直接播放原始帧会出现"没声音嘴却在动"。
+        closed_mouth 模式下用静音驱动口型模型，让嘴保持闭合。
+        """
+        nonlocal cursor
+        if count <= 0:
+            return
+        if args.idle == "closed_mouth":
+            sf.write(silence_wav, np.zeros(round(count * 16000 / FPS), dtype=np.int16), 16000)
+            produced = 0
+            for index, face in lipsync.render_faces(avatar, silence_wav, start_index=cursor):
+                frame_queue.put((index, face))
+                produced += 1
+            for k in range(produced, count):  # 取整造成的缺帧用原始帧补上
+                frame_queue.put((cursor + k, None))
+        else:
+            for k in range(count):
+                frame_queue.put((cursor + k, None))
+        cursor += count
     metrics = []
     try:
         for number, message in enumerate(danmaku, 1):
@@ -188,7 +215,7 @@ def main() -> None:
 
             def reply_worker(number=number, message=message, marks=marks, reply_sentences=reply_sentences) -> None:
                 try:
-                    for sentence in stream_sentences(llm.chat_stream(SYSTEM_PROMPT, message, temperature=temperature),
+                    for sentence in stream_sentences(llm.chat_stream(system_prompt, message, temperature=temperature),
                                                      first_clause=not args.no_first_clause):
                         marks.setdefault("first_sentence", time.perf_counter())
                         reply_sentences.append(sentence)
@@ -215,10 +242,8 @@ def main() -> None:
                     frame_count += 1
                 audio_parts.append(fit_audio(audio, rate, frame_count))
                 cursor += frame_count
-                for k in range(pause_frames):  # 句间停顿：播放原始画面
-                    frame_queue.put((cursor + k, None))
+                emit_idle(pause_frames)  # 句间停顿
                 audio_parts.append(np.zeros(round(pause_frames * rate / FPS), dtype=np.int16))
-                cursor += pause_frames
                 reply_frames += frame_count + pause_frames
             flush_frames()
             peak_memory = max(peak_memory, gpu_memory_used())
@@ -241,10 +266,8 @@ def main() -> None:
                       f"generated {m['duration']:.1f}s of video in {m['generation']:.1f}s", flush=True)
 
             gap_frames = round(args.gap * FPS)  # 回复之间的待机画面，不计入指标
-            for k in range(gap_frames):
-                frame_queue.put((cursor + k, None))
+            emit_idle(gap_frames)
             audio_parts.append(np.zeros(round(gap_frames * sample_rate / FPS), dtype=np.int16))
-            cursor += gap_frames
             flush_frames()
     finally:
         frame_queue.put(None)
@@ -254,6 +277,7 @@ def main() -> None:
         llm.stop()
         tts.stop()
         sentence_wav.unlink(missing_ok=True)
+        silence_wav.unlink(missing_ok=True)
 
     full_audio = np.concatenate(audio_parts)
     sf.write(wav_path, full_audio, sample_rate)

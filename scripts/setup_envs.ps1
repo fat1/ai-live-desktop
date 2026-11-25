@@ -5,7 +5,7 @@
 # while GPT-SoVITS needs transformers>=4.51 and a recent torch.
 # Each step is skipped when its marker file exists, so re-running is safe.
 
-param([ValidateSet('all', 'musetalk', 'sovits', 'llm')][string]$Only = 'all')
+param([ValidateSet('all', 'musetalk', 'sovits', 'cosyvoice', 'llm')][string]$Only = 'all')
 
 $ProgressPreference = 'SilentlyContinue'
 $Root = 'C:\ai_live'
@@ -170,6 +170,41 @@ if ($Only -in 'all', 'sovits') {
     }
     Invoke-Step 'sovits_check' {
         & $Py -c "import torch, torchaudio, transformers; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0)); print('transformers', transformers.__version__)"
+    }
+}
+
+# --------------------------------------------------------------- CosyVoice
+# Candidate TTS evaluated for expressiveness (emotion instructions, streaming output).
+if ($Only -in 'all', 'cosyvoice') {
+    $Py = "$Envs\cosyvoice\Scripts\python.exe"
+    $Repo = "$Repos\CosyVoice"
+    $Git = 'C:\Program Files\Git\cmd\git.exe'
+
+    Invoke-Step 'cosyvoice_repo' {
+        if (-not (Test-Path $Repo)) { & $Git clone --depth 1 https://github.com/FunAudioLLM/CosyVoice.git $Repo }
+        & $Git -C $Repo submodule update --init --recursive --depth 1
+    }
+    Invoke-Step 'cosyvoice_venv' {
+        & $Uv venv --python 3.10 --seed "$Envs\cosyvoice"
+    }
+    Invoke-Step 'cosyvoice_requirements' {
+        # Drop the extra index lines (uv takes indexes from the command line) and Linux-only pins.
+        $req = "$Root\downloads\cosyvoice_requirements.txt"
+        Get-Content "$Repo\requirements.txt" |
+            Where-Object { $_ -notmatch '^--extra-index-url' -and $_ -notmatch "sys_platform == 'linux'" } |
+            Set-Content -Encoding ascii $req
+        # openai-whisper's setup.py imports pkg_resources, which setuptools 81+ no longer ships.
+        $constraints = "$Root\downloads\build_constraints.txt"
+        Set-Content -Encoding ascii $constraints 'setuptools<81'
+        & $Uv pip install --python $Py -r $req --build-constraints $constraints `
+            --index https://download.pytorch.org/whl/cu121 --index-strategy unsafe-best-match
+    }
+    Invoke-Step 'cosyvoice_model' {
+        $env:PYTHONUTF8 = '1'
+        & $Py -c "from modelscope import snapshot_download; snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir=r'$Root\models\Fun-CosyVoice3-0.5B')"
+    }
+    Invoke-Step 'cosyvoice_check' {
+        & $Py -c "import torch, torchaudio; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
     }
 }
 
