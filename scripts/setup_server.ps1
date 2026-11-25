@@ -43,10 +43,10 @@ if (-not (Test-Path "$UvDir\uv.exe")) {
 }
 Add-MachinePath $UvDir
 # PyPI mirror inside China, and keep uv caches/pythons on a known path.
-[Environment]::SetEnvironmentVariable('UV_DEFAULT_INDEX', 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple', 'Machine')
+[Environment]::SetEnvironmentVariable('UV_DEFAULT_INDEX', 'https://mirrors.cloud.tencent.com/pypi/simple', 'Machine')
 [Environment]::SetEnvironmentVariable('UV_PYTHON_INSTALL_DIR', "$Tools\python", 'Machine')
 [Environment]::SetEnvironmentVariable('UV_CACHE_DIR', "$Root\uv_cache", 'Machine')
-$env:UV_DEFAULT_INDEX = 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple'
+$env:UV_DEFAULT_INDEX = 'https://mirrors.cloud.tencent.com/pypi/simple'
 $env:UV_PYTHON_INSTALL_DIR = "$Tools\python"
 $env:UV_CACHE_DIR = "$Root\uv_cache"
 # python-build-standalone mirror (the default source is a GitHub release).

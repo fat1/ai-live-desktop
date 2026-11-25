@@ -15,8 +15,8 @@ $Envs = "$Root\envs"
 $Markers = "$Root\markers"
 New-Item -ItemType Directory -Force -Path $Markers, "$Root\models\llm" | Out-Null
 
-$env:UV_DEFAULT_INDEX = 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple'
-$env:PIP_INDEX_URL = 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple'
+$env:UV_DEFAULT_INDEX = 'https://mirrors.cloud.tencent.com/pypi/simple'
+$env:PIP_INDEX_URL = 'https://mirrors.cloud.tencent.com/pypi/simple'
 $env:UV_PYTHON_INSTALL_DIR = "$Root\tools\python"
 $env:UV_CACHE_DIR = "$Root\uv_cache"
 $env:UV_HTTP_TIMEOUT = '300'
