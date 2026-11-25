@@ -1,6 +1,6 @@
-"""语音合成。两种引擎，接口相同（文本进，采样率和 int16 音频出）：
+"""语音合成。两种引擎，接口相同（文本进，按块产出采样率和 int16 音频）：
 
-- VoiceCloner：GPT-SoVITS，按参考音频克隆音色；
+- VoiceCloner：GPT-SoVITS，按参考音频克隆音色，支持边合成边输出；
 - PresetTts：Kokoro，使用内置的预置音色，不做克隆，模型小、速度快。
 
 依赖：GPT-SoVITS 仓库及其环境（FFmpeg 动态库需在 PATH 中，torchcodec 读音频用）；kokoro、misaki[zh]。
@@ -11,11 +11,14 @@ import os
 import queue
 import sys
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+# 合成函数：给一句文本，逐块产出 (采样率, int16 单声道音频)
+SynthesizeStream = Callable[[str], Iterator[tuple[int, np.ndarray]]]
 
 
 @dataclass
@@ -28,22 +31,27 @@ class Voice:
 
 
 def make_clone_engine(sovits_root: str, voice: "Voice", version: str = "v2ProPlus",
-                      parallel_infer: bool = False) -> Callable[[str], tuple[int, np.ndarray]]:
-    """加载声音克隆引擎并预热，返回"文本 -> (采样率, 音频)"的合成函数。在语音子进程里调用。"""
-    cloner = VoiceCloner(sovits_root, version, parallel_infer)
+                      streaming: bool = True) -> SynthesizeStream:
+    """加载声音克隆引擎并预热，返回合成函数。在语音子进程里调用。
+
+    参数:
+        streaming: True 时边合成边输出（首块约 0.6 秒），False 时整句合成完才输出
+    """
+    cloner = VoiceCloner(sovits_root, version)
     cloner.warm_up(voice)
-    return lambda text: cloner.synthesize(text, voice)
+    if streaming:
+        return lambda text: cloner.stream(text, voice)
+    return lambda text: iter([cloner.synthesize(text, voice)])
 
 
-def make_preset_engine(model_dir: str, voice_name: str = "zf_001",
-                       speed: float = 1.0) -> Callable[[str], tuple[int, np.ndarray]]:
+def make_preset_engine(model_dir: str, voice_name: str = "zf_001", speed: float = 1.0) -> SynthesizeStream:
     """加载预置音色引擎并预热，返回合成函数。在语音子进程里调用。"""
     preset = PresetTts(model_dir, voice_name, speed)
     preset.synthesize("你好，欢迎来到直播间。")
-    return preset.synthesize
+    return lambda text: iter([preset.synthesize(text)])
 
 
-def _worker(factory: Callable[[], Callable[[str], tuple[int, np.ndarray]]], ffmpeg_dir: str,
+def _worker(factory: Callable[[], SynthesizeStream], ffmpeg_dir: str,
             requests: multiprocessing.Queue, responses: multiprocessing.Queue) -> None:
     """语音合成子进程的主循环：加载模型、预热，然后按顺序处理请求。"""
     try:
@@ -56,12 +64,12 @@ def _worker(factory: Callable[[], Callable[[str], tuple[int, np.ndarray]]], ffmp
                 responses.put(("mark", key, None, None))
                 continue
             try:
-                sample_rate, audio = synthesize(text)
+                for sample_rate, chunk in synthesize(text):
+                    responses.put(("chunk", key, sample_rate, chunk))
+                responses.put(("sentence_end", key, None, None))
             except Exception:
                 # 单句失败（例如文本无法转成音素）不应该让整个进程退出
                 responses.put(("skipped", key, None, traceback.format_exc()))
-                continue
-            responses.put(("audio", key, sample_rate, audio))
     except Exception:
         responses.put(("error", traceback.format_exc(), None, None))
 
@@ -74,8 +82,7 @@ class TtsProcess:
     请求按提交顺序处理，结果也按同样顺序返回。
     """
 
-    def __init__(self, factory: Callable[[], Callable[[str], tuple[int, np.ndarray]]],
-                 ffmpeg_dir: str | Path) -> None:
+    def __init__(self, factory: Callable[[], SynthesizeStream], ffmpeg_dir: str | Path) -> None:
         """
         参数:
             factory: 在子进程里创建合成函数的可调用对象，必须能被 pickle，
@@ -106,8 +113,10 @@ class TtsProcess:
         """取下一个结果，阻塞直到有结果。
 
         返回:
-            ("audio", key, 采样率, 音频)、("mark", key, None, None)，
-            或 ("skipped", key, None, 出错信息)，表示这一句合成失败、已跳过
+            ("chunk", key, 采样率, 音频块)：一句话的一部分音频，一句话会有一到多块；
+            ("sentence_end", key, None, None)：这句话的音频已全部给出；
+            ("skipped", key, None, 出错信息)：这句话合成失败，已放弃（之前可能已给出部分音频）；
+            ("mark", key, None, None)：submit 提交的标记
         抛出:
             RuntimeError: 子进程加载模型失败、已退出，或超过 timeout 秒没有返回
         """
@@ -143,13 +152,11 @@ class VoiceCloner:
         "v2Pro": ("s1v3.ckpt", "v2Pro/s2Gv2Pro.pth"),
     }
 
-    def __init__(self, sovits_root: str | Path, version: str = "v2ProPlus", parallel_infer: bool = False) -> None:
+    def __init__(self, sovits_root: str | Path, version: str = "v2ProPlus") -> None:
         """
         参数:
             sovits_root: GPT-SoVITS 仓库根目录
-            version: 模型版本，v2ProPlus 或 v2Pro
-            parallel_infer: GPT-SoVITS 的并行推理开关。单独逐句合成时关闭更快（单句 2.0 秒降到 1.3 秒，
-                见 scripts/bench_tts_modes.py）
+            version: 模型版本。流式输出只支持 v2ProPlus
         抛出:
             KeyError: 不支持的版本
 
@@ -162,7 +169,6 @@ class VoiceCloner:
                 sys.path.insert(0, path)
         from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
 
-        self._parallel_infer = parallel_infer
         t2s, vits = self._WEIGHTS[version]
         base = "GPT_SoVITS/pretrained_models"
         self._tts = TTS(TTS_Config({"custom": {
@@ -176,28 +182,19 @@ class VoiceCloner:
         }}))
 
     def warm_up(self, voice: Voice) -> None:
-        """用指定音色先合成一句短话。
+        """用指定音色先合成一句短话，两条合成路径各走一遍。
 
         首次合成要处理参考音频并初始化各子模型，实测约 16 秒；放在加载阶段做，
         开播后的第一句话就不会卡顿。
         """
         self.synthesize("你好，欢迎来到直播间。", voice)
+        for _ in self.stream("你好，欢迎来到直播间。", voice):
+            pass
 
-    def synthesize(self, text: str, voice: Voice, text_lang: str = "zh") -> tuple[int, np.ndarray]:
-        """合成一句话。
-
-        参数:
-            text: 要说的内容
-            voice: 音色
-            text_lang: 内容的语言
-        返回:
-            (采样率, int16 单声道音频)
-        抛出:
-            ValueError: text 为空
-        """
+    def _request(self, text: str, voice: Voice, text_lang: str) -> dict:
         if not text.strip():
             raise ValueError("text 不能为空")
-        pieces = list(self._tts.run({
+        return {
             "text": text,
             "text_lang": text_lang,
             "ref_audio_path": voice.ref_audio,
@@ -205,9 +202,42 @@ class VoiceCloner:
             "prompt_lang": voice.ref_lang,
             "text_split_method": "cut0",
             "batch_size": 1,
-            "parallel_infer": self._parallel_infer,
-        }))
+            # 逐句合成时关闭并行推理更快（见 scripts/bench_tts_modes.py）
+            "parallel_infer": False,
+        }
+
+    def synthesize(self, text: str, voice: Voice, text_lang: str = "zh") -> tuple[int, np.ndarray]:
+        """合成一句话，整句完成后返回。
+
+        返回:
+            (采样率, int16 单声道音频)
+        抛出:
+            ValueError: text 为空
+        """
+        pieces = list(self._tts.run(self._request(text, voice, text_lang)))
         return pieces[0][0], np.concatenate([piece[1] for piece in pieces])
+
+    def stream(self, text: str, voice: Voice, text_lang: str = "zh") -> Iterator[tuple[int, np.ndarray]]:
+        """边合成边输出一句话。
+
+        用的是 GPT-SoVITS 的加速语义流式（上游 docs/en/semantic_streaming.md）：
+        固定长度的首块让第一段音频尽快出来（实测约 0.6 秒），之后的块逐步加大以减少开销。
+        总耗时比整句合成多三到五成，换来更早开口。
+
+        返回:
+            逐块产出 (采样率, int16 单声道音频)，各块首尾相接即为整句
+        抛出:
+            ValueError: text 为空
+        """
+        request = self._request(text, voice, text_lang) | {
+            "streaming_mode": True,
+            "gpt_streaming": True,
+            "fixed_length_chunk": True,
+            "streaming_window_mode": "hybrid",
+        }
+        for sample_rate, chunk in self._tts.run(request):
+            if len(chunk):  # 流式模式会产出空块
+                yield sample_rate, chunk
 
 
 class PresetTts:
