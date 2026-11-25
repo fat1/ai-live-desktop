@@ -18,6 +18,7 @@
 """
 
 import argparse
+import functools
 import os
 import queue
 import re
@@ -98,6 +99,7 @@ def main() -> None:
     parser.add_argument("--pause", type=float, default=0.4, help="句间停顿秒数")
     parser.add_argument("--gap", type=float, default=1.0, help="两条回复之间的待机秒数")
     parser.add_argument("--llm_context", type=int, default=2048)
+    parser.add_argument("--preset_voice", help="使用预置音色（不做声音克隆），给出音色名，例如 zf_001")
     parser.add_argument("--tts_parallel", action="store_true", help="开启 GPT-SoVITS 的并行推理")
     parser.add_argument("--no_first_clause", action="store_true", help="第一句不按逗号提前切分")
     parser.add_argument("--deterministic", action="store_true", help="大模型温度设为 0，便于多次运行对比")
@@ -105,7 +107,7 @@ def main() -> None:
 
     from engines.lipsync import LipSyncEngine
     from engines.llm import LlmServer
-    from engines.tts import TtsProcess, Voice
+    from engines.tts import TtsProcess, Voice, make_clone_engine, make_preset_engine
 
     ffmpeg_dir = root / "tools/ffmpeg_shared/bin"
     out_path = Path(args.out).resolve()
@@ -115,7 +117,12 @@ def main() -> None:
     print(f"gpu memory before loading: {gpu_memory_used()} MiB", flush=True)
     load_start = time.perf_counter()
     voice = Voice(ref_audio=str(Path(args.ref_audio).resolve()), ref_text=args.ref_text, ref_lang=args.ref_lang)
-    tts = TtsProcess(root / "repos/GPT-SoVITS", voice, ffmpeg_dir, parallel_infer=args.tts_parallel)
+    if args.preset_voice:
+        factory = functools.partial(make_preset_engine, str(root / "models/kokoro-zh"), args.preset_voice)
+    else:
+        factory = functools.partial(make_clone_engine, str(root / "repos/GPT-SoVITS"), voice,
+                                    parallel_infer=args.tts_parallel)
+    tts = TtsProcess(factory, ffmpeg_dir)
     temperature = 0.0 if args.deterministic else 0.7
     llm = LlmServer(root / "tools/llama_cuda", root / "models/llm/Qwen3-4B-Q4_K_M.gguf",
                     context_size=args.llm_context)

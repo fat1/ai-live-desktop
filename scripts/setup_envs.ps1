@@ -132,6 +132,13 @@ if ($Only -in 'all', 'sovits') {
             triton-windows 'huggingface-hub<1.0' `
             --index https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
     }
+    Invoke-Step 'preset_tts_kokoro' {
+        # Preset (non-cloned) voices: Kokoro, a small and fast TTS model with built-in Chinese voices.
+        & $Uv pip install --python $Py kokoro 'misaki[zh]' 'huggingface-hub<1.0'
+        if ($LASTEXITCODE -ne 0) { throw 'kokoro install' }
+        $env:PYTHONUTF8 = '1'  # the hf CLI prints non-GBK characters
+        & "$Envs\sovits\Scripts\huggingface-cli.exe" download hexgrad/Kokoro-82M-v1.1-zh --local-dir "$Root\models\kokoro-zh"
+    }
     Invoke-Step 'sovits_pretrained' {
         $zip = "$Root\downloads\sovits_pretrained_models.zip"
         Get-RemoteFile "$Src/pretrained_models.zip" $zip

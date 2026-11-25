@@ -1,12 +1,16 @@
-"""语音合成：封装 GPT-SoVITS，克隆音色和预置音色共用同一接口。
+"""语音合成。两种引擎，接口相同（文本进，采样率和 int16 音频出）：
 
-依赖：GPT-SoVITS 仓库及其环境；FFmpeg 动态库需在 PATH 中（torchcodec 读音频用）。
+- VoiceCloner：GPT-SoVITS，按参考音频克隆音色；
+- PresetTts：Kokoro，使用内置的预置音色，不做克隆，模型小、速度快。
+
+依赖：GPT-SoVITS 仓库及其环境（FFmpeg 动态库需在 PATH 中，torchcodec 读音频用）；kokoro、misaki[zh]。
 """
 
 import multiprocessing
 import os
 import sys
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,20 +26,35 @@ class Voice:
     ref_lang: str = "zh"
 
 
-def _worker(sovits_root: str, voice: "Voice", ffmpeg_dir: str, version: str, parallel_infer: bool,
+def make_clone_engine(sovits_root: str, voice: "Voice", version: str = "v2ProPlus",
+                      parallel_infer: bool = False) -> Callable[[str], tuple[int, np.ndarray]]:
+    """加载声音克隆引擎并预热，返回"文本 -> (采样率, 音频)"的合成函数。在语音子进程里调用。"""
+    cloner = VoiceCloner(sovits_root, version, parallel_infer)
+    cloner.warm_up(voice)
+    return lambda text: cloner.synthesize(text, voice)
+
+
+def make_preset_engine(model_dir: str, voice_name: str = "zf_001",
+                       speed: float = 1.0) -> Callable[[str], tuple[int, np.ndarray]]:
+    """加载预置音色引擎并预热，返回合成函数。在语音子进程里调用。"""
+    preset = PresetTts(model_dir, voice_name, speed)
+    preset.synthesize("你好，欢迎来到直播间。")
+    return preset.synthesize
+
+
+def _worker(factory: Callable[[], Callable[[str], tuple[int, np.ndarray]]], ffmpeg_dir: str,
             requests: multiprocessing.Queue, responses: multiprocessing.Queue) -> None:
     """语音合成子进程的主循环：加载模型、预热，然后按顺序处理请求。"""
     try:
         os.environ["PATH"] = f"{ffmpeg_dir};{os.environ['PATH']}"  # torchcodec 需要 FFmpeg 动态库
-        cloner = VoiceCloner(sovits_root, version, parallel_infer)
-        cloner.warm_up(voice)
+        synthesize = factory()
         responses.put(("ready", None, None, None))
         while (request := requests.get()) is not None:
             key, text = request
             if text is None:  # 标记请求：原样送回，调用方用它判断一批句子是否处理完
                 responses.put(("mark", key, None, None))
                 continue
-            sample_rate, audio = cloner.synthesize(text, voice)
+            sample_rate, audio = synthesize(text)
             responses.put(("audio", key, sample_rate, audio))
     except Exception:
         responses.put(("error", traceback.format_exc(), None, None))
@@ -49,14 +68,18 @@ class TtsProcess:
     请求按提交顺序处理，结果也按同样顺序返回。
     """
 
-    def __init__(self, sovits_root: str | Path, voice: "Voice", ffmpeg_dir: str | Path,
-                 version: str = "v2ProPlus", parallel_infer: bool = False) -> None:
+    def __init__(self, factory: Callable[[], Callable[[str], tuple[int, np.ndarray]]],
+                 ffmpeg_dir: str | Path) -> None:
+        """
+        参数:
+            factory: 在子进程里创建合成函数的可调用对象，必须能被 pickle，
+                例如 functools.partial(make_clone_engine, ...) 或 functools.partial(make_preset_engine, ...)
+            ffmpeg_dir: FFmpeg 动态库所在目录
+        """
         self._requests: multiprocessing.Queue = multiprocessing.Queue()
         self._responses: multiprocessing.Queue = multiprocessing.Queue()
         self._process = multiprocessing.Process(
-            target=_worker, daemon=True,
-            args=(str(sovits_root), voice, str(ffmpeg_dir), version, parallel_infer,
-                  self._requests, self._responses))
+            target=_worker, daemon=True, args=(factory, str(ffmpeg_dir), self._requests, self._responses))
 
     def start(self) -> None:
         """启动子进程并等待模型加载和预热完成。
@@ -168,3 +191,44 @@ class VoiceCloner:
             "parallel_infer": self._parallel_infer,
         }))
         return pieces[0][0], np.concatenate([piece[1] for piece in pieces])
+
+
+class PresetTts:
+    """Kokoro 预置音色语音合成（82M 参数的小模型，内置一百多个中文音色，输出 24 kHz）。"""
+
+    def __init__(self, model_dir: str | Path, voice_name: str = "zf_001", speed: float = 1.0) -> None:
+        """
+        参数:
+            model_dir: Kokoro-82M-v1.1-zh 模型目录（含 config.json、kokoro-v1_1-zh.pth、voices）
+            voice_name: 音色名，对应 voices 目录下的文件名，zf 开头为女声，zm 开头为男声
+            speed: 语速倍率
+        抛出:
+            FileNotFoundError: 模型或音色文件不存在
+        """
+        import torch
+        from kokoro import KModel, KPipeline
+
+        model_dir = Path(model_dir)
+        voice_path = model_dir / "voices" / f"{voice_name}.pt"
+        if not voice_path.exists():
+            raise FileNotFoundError(f"找不到音色文件: {voice_path}")
+        repo_id = "hexgrad/Kokoro-82M-v1.1-zh"
+        model = KModel(repo_id=repo_id, config=str(model_dir / "config.json"),
+                       model=str(model_dir / "kokoro-v1_1-zh.pth")).to("cuda").eval()
+        self._pipeline = KPipeline(lang_code="z", repo_id=repo_id, model=model)
+        self._voice = torch.load(voice_path, weights_only=True)
+        self._speed = speed
+
+    def synthesize(self, text: str) -> tuple[int, np.ndarray]:
+        """合成一句话。
+
+        返回:
+            (采样率, int16 单声道音频)
+        抛出:
+            ValueError: text 为空
+        """
+        if not text.strip():
+            raise ValueError("text 不能为空")
+        pieces = [result.audio.cpu().numpy() for result in self._pipeline(text, voice=self._voice, speed=self._speed)]
+        audio = np.concatenate(pieces)
+        return 24000, (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
