@@ -22,12 +22,12 @@ class Voice:
     ref_lang: str = "zh"
 
 
-def _worker(sovits_root: str, voice: "Voice", ffmpeg_dir: str, version: str,
+def _worker(sovits_root: str, voice: "Voice", ffmpeg_dir: str, version: str, parallel_infer: bool,
             requests: multiprocessing.Queue, responses: multiprocessing.Queue) -> None:
     """语音合成子进程的主循环：加载模型、预热，然后按顺序处理请求。"""
     try:
         os.environ["PATH"] = f"{ffmpeg_dir};{os.environ['PATH']}"  # torchcodec 需要 FFmpeg 动态库
-        cloner = VoiceCloner(sovits_root, version)
+        cloner = VoiceCloner(sovits_root, version, parallel_infer)
         cloner.warm_up(voice)
         responses.put(("ready", None, None, None))
         while (request := requests.get()) is not None:
@@ -50,12 +50,13 @@ class TtsProcess:
     """
 
     def __init__(self, sovits_root: str | Path, voice: "Voice", ffmpeg_dir: str | Path,
-                 version: str = "v2ProPlus") -> None:
+                 version: str = "v2ProPlus", parallel_infer: bool = False) -> None:
         self._requests: multiprocessing.Queue = multiprocessing.Queue()
         self._responses: multiprocessing.Queue = multiprocessing.Queue()
         self._process = multiprocessing.Process(
             target=_worker, daemon=True,
-            args=(str(sovits_root), voice, str(ffmpeg_dir), version, self._requests, self._responses))
+            args=(str(sovits_root), voice, str(ffmpeg_dir), version, parallel_infer,
+                  self._requests, self._responses))
 
     def start(self) -> None:
         """启动子进程并等待模型加载和预热完成。
@@ -102,11 +103,13 @@ class VoiceCloner:
         "v2Pro": ("s1v3.ckpt", "v2Pro/s2Gv2Pro.pth"),
     }
 
-    def __init__(self, sovits_root: str | Path, version: str = "v2ProPlus") -> None:
+    def __init__(self, sovits_root: str | Path, version: str = "v2ProPlus", parallel_infer: bool = False) -> None:
         """
         参数:
             sovits_root: GPT-SoVITS 仓库根目录
             version: 模型版本，v2ProPlus 或 v2Pro
+            parallel_infer: GPT-SoVITS 的并行推理开关。单独逐句合成时关闭更快（单句 2.0 秒降到 1.3 秒，
+                见 scripts/bench_tts_modes.py）
         抛出:
             KeyError: 不支持的版本
 
@@ -119,6 +122,7 @@ class VoiceCloner:
                 sys.path.insert(0, path)
         from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
 
+        self._parallel_infer = parallel_infer
         t2s, vits = self._WEIGHTS[version]
         base = "GPT_SoVITS/pretrained_models"
         self._tts = TTS(TTS_Config({"custom": {
@@ -161,6 +165,6 @@ class VoiceCloner:
             "prompt_lang": voice.ref_lang,
             "text_split_method": "cut0",
             "batch_size": 1,
-            "parallel_infer": True,
+            "parallel_infer": self._parallel_infer,
         }))
         return pieces[0][0], np.concatenate([piece[1] for piece in pieces])

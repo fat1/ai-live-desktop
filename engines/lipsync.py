@@ -14,6 +14,7 @@ import json
 import os
 import pickle
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import soundfile as sf
 import torch
 
 
@@ -100,6 +102,14 @@ class LipSyncEngine:
             predicted = self._unet(latents, self._timesteps, encoder_hidden_states=self._pe(audio)).sample
             self._vae.decode(predicted / self._scaling).sample
         torch.cuda.synchronize()
+        # 音频特征这条通路（读音频、梅尔频谱、Whisper 编码器）首次调用也很慢，实测约 2 秒，
+        # 用一秒静音走一遍
+        with tempfile.TemporaryDirectory() as folder:
+            silence = os.path.join(folder, "silence.wav")
+            sf.write(silence, np.zeros(16000, dtype=np.int16), 16000)
+            features, length = self._audio.get_audio_feature(silence, weight_dtype=self.dtype)
+            self._audio.get_whisper_chunk(features, self.device, self.dtype, self._whisper, length, fps=self.fps,
+                                          audio_padding_length_left=2, audio_padding_length_right=2)
 
     def load_avatar(self, avatar_dir: str | Path) -> Avatar:
         """读取预处理好的素材目录。

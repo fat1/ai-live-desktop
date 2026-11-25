@@ -37,27 +37,31 @@ SYSTEM_PROMPT = (
 )
 FPS = 25
 SENTENCE_END = re.compile(r"[。！？!?；;\n]")
+CLAUSE_END = re.compile(r"[。！？!?；;\n，,、：:]")
 
 
-def stream_sentences(deltas: Iterable[str], min_chars: int = 6) -> Iterator[str]:
+def stream_sentences(deltas: Iterable[str], min_chars: int = 6, first_clause: bool = True) -> Iterator[str]:
     """把流式输出的文本片段实时切成句子。
 
     参数:
         deltas: 大模型逐步产出的文本片段
         min_chars: 短于该长度的句子先不产出，和后面的内容合并
+        first_clause: 第一段遇到逗号就切出来，让数字人更早开口；之后仍按整句切
     返回:
         逐句产出，保留句末标点
     """
     buffer = ""
+    pattern = CLAUSE_END if first_clause else SENTENCE_END
     for delta in deltas:
         buffer += delta
         search_from = 0
-        while (match := SENTENCE_END.search(buffer, search_from)) is not None:
+        while (match := pattern.search(buffer, search_from)) is not None:
             if match.end() >= min_chars:
                 sentence = buffer[:match.end()].strip()
                 buffer = buffer[match.end():]
                 search_from = 0
                 if sentence:
+                    pattern = SENTENCE_END  # 只有第一段按逗号切，之后恢复按句切
                     yield sentence
             else:
                 search_from = match.end()
@@ -94,6 +98,9 @@ def main() -> None:
     parser.add_argument("--pause", type=float, default=0.4, help="句间停顿秒数")
     parser.add_argument("--gap", type=float, default=1.0, help="两条回复之间的待机秒数")
     parser.add_argument("--llm_context", type=int, default=2048)
+    parser.add_argument("--tts_parallel", action="store_true", help="开启 GPT-SoVITS 的并行推理")
+    parser.add_argument("--no_first_clause", action="store_true", help="第一句不按逗号提前切分")
+    parser.add_argument("--deterministic", action="store_true", help="大模型温度设为 0，便于多次运行对比")
     args = parser.parse_args()
 
     from engines.lipsync import LipSyncEngine
@@ -108,7 +115,8 @@ def main() -> None:
     print(f"gpu memory before loading: {gpu_memory_used()} MiB", flush=True)
     load_start = time.perf_counter()
     voice = Voice(ref_audio=str(Path(args.ref_audio).resolve()), ref_text=args.ref_text, ref_lang=args.ref_lang)
-    tts = TtsProcess(root / "repos/GPT-SoVITS", voice, ffmpeg_dir)
+    tts = TtsProcess(root / "repos/GPT-SoVITS", voice, ffmpeg_dir, parallel_infer=args.tts_parallel)
+    temperature = 0.0 if args.deterministic else 0.7
     llm = LlmServer(root / "tools/llama_cuda", root / "models/llm/Qwen3-4B-Q4_K_M.gguf",
                     context_size=args.llm_context)
     # 三个模型的加载互不依赖：语音在子进程里加载，大模型是外部进程，本进程同时加载口型
@@ -173,7 +181,8 @@ def main() -> None:
 
             def reply_worker(number=number, message=message, marks=marks, reply_sentences=reply_sentences) -> None:
                 try:
-                    for sentence in stream_sentences(llm.chat_stream(SYSTEM_PROMPT, message)):
+                    for sentence in stream_sentences(llm.chat_stream(SYSTEM_PROMPT, message, temperature=temperature),
+                                                     first_clause=not args.no_first_clause):
                         marks.setdefault("first_sentence", time.perf_counter())
                         reply_sentences.append(sentence)
                         tts.submit(number, sentence)
