@@ -1,11 +1,13 @@
 # Create the two Python environments and download model weights on the dev server.
 # NOTE: keep this file ASCII-only (Windows PowerShell 5.1 reads BOM-less files as ANSI).
-# Usage: powershell -ExecutionPolicy Bypass -File setup_envs.ps1 [-Only musetalk|sovits|llm]
+# Usage: powershell -ExecutionPolicy Bypass -File setup_envs.ps1 [-Only musetalk|sovits|llm|cosyvoice|flashhead]
 # Two separate environments are required: MuseTalk pins transformers==4.39 / torch 2.0.1,
 # while GPT-SoVITS needs transformers>=4.51 and a recent torch.
+# cosyvoice and flashhead are candidates that were evaluated and not adopted; they are
+# installed only when named with -Only, never by the default 'all'.
 # Each step is skipped when its marker file exists, so re-running is safe.
 
-param([ValidateSet('all', 'musetalk', 'sovits', 'cosyvoice', 'llm')][string]$Only = 'all')
+param([ValidateSet('all', 'musetalk', 'sovits', 'cosyvoice', 'flashhead', 'llm')][string]$Only = 'all')
 
 $ProgressPreference = 'SilentlyContinue'
 $Root = 'C:\ai_live'
@@ -185,8 +187,8 @@ if ($Only -in 'all', 'sovits') {
 }
 
 # --------------------------------------------------------------- CosyVoice
-# Candidate TTS evaluated for expressiveness (emotion instructions, streaming output).
-if ($Only -in 'all', 'cosyvoice') {
+# Candidate TTS evaluated for expressiveness (emotion instructions, streaming output). Not adopted.
+if ($Only -eq 'cosyvoice') {
     $Py = "$Envs\cosyvoice\Scripts\python.exe"
     $Repo = "$Repos\CosyVoice"
     $Git = 'C:\Program Files\Git\cmd\git.exe'
@@ -217,6 +219,60 @@ if ($Only -in 'all', 'cosyvoice') {
     }
     Invoke-Step 'cosyvoice_check' {
         & $Py -c "import torch, torchaudio; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+    }
+}
+
+# ----------------------------------------------------- SoulX-FlashHead Lite
+# Candidate talking-head model (512x512, generates the whole head from one image). Not adopted;
+# see the README for the test results. Run it with bench_flashhead.ps1.
+if ($Only -eq 'flashhead') {
+    $Py = "$Envs\flashhead\Scripts\python.exe"
+    $Repo = "$Repos\SoulX-FlashHead"
+    $Git = 'C:\Program Files\Git\cmd\git.exe'
+    $Models = "$Repo\models"
+
+    Invoke-Step 'flashhead_repo' {
+        if (-not (Test-Path $Repo)) { & $Git clone --depth 1 https://github.com/Soul-AILab/SoulX-FlashHead.git $Repo }
+    }
+    Invoke-Step 'flashhead_venv' {
+        & $Uv venv --python 3.10 --seed "$Envs\flashhead"
+    }
+    Invoke-Step 'flashhead_requirements' {
+        # Upstream pins torch 2.7.1; the versions below match the sovits environment instead, so uv
+        # hard-links them from its cache and the environment costs well under 1 GB of disk.
+        # Left out on purpose: xfuser (Linux-only; replaced by scripts\flashhead_stubs), flash_attn
+        # and xformers (optional; the code falls back to torch attention), nvidia-nccl-cu12
+        # (multi-GPU only), gradio and decord (not used by generate_video.py).
+        & $Uv pip install --python $Py 'torch==2.14.1+cu126' 'torchvision==0.29.2' 'numpy==1.26.4' `
+            'transformers==4.57.3' 'diffusers==0.39.0' 'accelerate==1.15.0' 'opencv-python==4.11.0.86' `
+            'librosa==0.10.2' 'loguru==0.8.0' 'einops==0.8.2' 'safetensors==0.8.0' 'pyyaml==6.0.4' `
+            'pillow==12.3.0' triton-windows 'mediapipe==0.10.9' easydict ftfy imageio imageio-ffmpeg `
+            scikit-image pyloudnorm tqdm `
+            --index https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
+    }
+    Invoke-Step 'flashhead_models' {
+        # Lite needs Model_Lite (5.7 GB) and VAE_LTX (1.6 GB) only; Model_Pro and VAE_Wan are skipped.
+        # huggingface-cli stalled on these files from the server network, so use resumable curl.
+        $ms = 'https://www.modelscope.cn/models/Soul-AILab/SoulX-FlashHead-1_3B/resolve/master'
+        $hf = 'https://hf-mirror.com/facebook/wav2vec2-base-960h/resolve/main'
+        New-Item -ItemType Directory -Force -Path "$Models\SoulX-FlashHead-1_3B\Model_Lite", `
+            "$Models\SoulX-FlashHead-1_3B\VAE_LTX", "$Models\wav2vec2-base-960h" | Out-Null
+        foreach ($part in 'Model_Lite', 'VAE_LTX') {
+            foreach ($name in 'config.json', 'diffusion_pytorch_model.safetensors') {
+                Get-RemoteFile "$ms/$part/$name" "$Models\SoulX-FlashHead-1_3B\$part\$name"
+                if ($LASTEXITCODE -ne 0) { throw "download $part/$name" }
+            }
+        }
+        foreach ($name in 'config.json', 'preprocessor_config.json', 'feature_extractor_config.json', 'model.safetensors') {
+            Get-RemoteFile "$hf/$name" "$Models\wav2vec2-base-960h\$name"
+            if ($LASTEXITCODE -ne 0) { throw "download wav2vec2 $name" }
+        }
+    }
+    Invoke-Step 'flashhead_check' {
+        $env:PYTHONPATH = "$PSScriptRoot\flashhead_stubs"
+        Push-Location $Repo   # the code reads its config through a relative path
+        & $Py -c "import torch, flash_head.inference; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+        Pop-Location
     }
 }
 
