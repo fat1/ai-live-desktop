@@ -1,3 +1,5 @@
+**简体中文** | [English](README.en.md)
+
 # AI 数字人直播助手（ai-live-desktop）
 
 用你自己的视频和声音，在自己的电脑上做一个会说话的数字人主播。
