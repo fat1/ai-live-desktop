@@ -41,8 +41,14 @@ function Invoke-Step {
 }
 
 function Get-RemoteFile {
+    # Large downloads are often cut mid-transfer; resume until complete.
     param([string]$Url, [string]$OutFile)
-    curl.exe -L --fail --retry 3 -C - --silent --show-error -o $OutFile $Url
+    foreach ($attempt in 1..30) {
+        curl.exe -L --fail -C - --silent --show-error -o $OutFile $Url
+        if ($LASTEXITCODE -eq 0) { return }
+        Write-Host "download interrupted (curl exit $LASTEXITCODE), resuming, attempt $attempt"
+        Start-Sleep -Seconds 3
+    }
 }
 
 # ---------------------------------------------------------------- MuseTalk
@@ -71,7 +77,10 @@ if ($Only -in 'all', 'musetalk') {
         & $Py -m mim install mmengine
         & $Py -m mim install 'mmcv==2.0.1'
         & $Py -m mim install 'mmdet==3.1.0'
-        & $Py -m mim install 'mmpose==1.1.0'
+        # mmpose depends on chumpy, which cannot be built with current pip and is only
+        # used for SMPL body models. Install mmpose without deps and add the rest by hand.
+        & $Py -m pip install --no-deps 'mmpose==1.1.0'
+        & $Py -m pip install json_tricks munkres xtcocotools scipy matplotlib 'numpy==1.23.5'
     }
     Invoke-Step 'musetalk_weights' {
         $m = "$Repo\models"

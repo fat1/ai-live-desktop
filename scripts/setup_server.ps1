@@ -80,6 +80,24 @@ if (-not (Test-Path "$FfmpegDir\bin\ffmpeg.exe")) {
 }
 Add-MachinePath "$FfmpegDir\bin"
 
+# --- Microsoft VC++ runtime -------------------------------------------------
+# llama.cpp crashes on start with the old runtime shipped in the server image.
+$redist = Join-Path $Downloads 'vc_redist.x64.exe'
+Get-RemoteFile 'https://aka.ms/vs/17/release/vc_redist.x64.exe' $redist
+Start-Process -Wait -FilePath $redist -ArgumentList '/install', '/quiet', '/norestart'
+
+# --- MSVC build tools -------------------------------------------------------
+# Needed to compile Python packages without Windows wheels (jieba_fast for GPT-SoVITS).
+$VsRoot = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
+if (-not (Test-Path "$VsRoot\VC\Tools\MSVC")) {
+    $bootstrap = Join-Path $Downloads 'vs_BuildTools.exe'
+    Get-RemoteFile 'https://aka.ms/vs/17/release/vs_BuildTools.exe' $bootstrap
+    $proc = Start-Process -Wait -PassThru -FilePath $bootstrap -ArgumentList '--quiet', '--wait', '--norestart', '--nocache',
+        '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+        '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621'
+    Write-Host "VS Build Tools installer exit code: $($proc.ExitCode)"
+}
+
 # --- Report ---------------------------------------------------------------
 Write-Host '--- versions ---'
 & "$UvDir\uv.exe" --version
