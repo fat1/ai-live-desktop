@@ -124,6 +124,14 @@ if ($Only -in 'all', 'sovits') {
         & $Uv pip install --python $Py -r $req resampy `
             --index https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
     }
+    Invoke-Step 'sovits_lipsync_runtime' {
+        # MuseTalk's runtime (not its preprocessing) also runs in this environment, so that
+        # TTS and lip sync share one process and one CUDA context. huggingface-hub must stay
+        # below 1.0 for transformers 4.x; triton-windows is required by torch.compile.
+        & $Uv pip install --python $Py torchvision diffusers einops omegaconf opencv-python accelerate `
+            triton-windows 'huggingface-hub<1.0' `
+            --index https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
+    }
     Invoke-Step 'sovits_pretrained' {
         $zip = "$Root\downloads\sovits_pretrained_models.zip"
         Get-RemoteFile "$Src/pretrained_models.zip" $zip
