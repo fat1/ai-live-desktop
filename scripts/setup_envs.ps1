@@ -173,6 +173,17 @@ if ($Only -in 'all', 'sovits') {
     }
 }
 
+# ------------------------------------------------------- mouth enhancement
+if ($Only -in 'all', 'sovits') {
+    Invoke-Step 'enhance_weights' {
+        # Small super-resolution net for the mouth region (Real-ESRGAN compact, BSD-3, 5 MB).
+        # GitHub release downloads stall from the server network; if this fails, download the
+        # file elsewhere and copy it to C:\ai_live\models\sr\.
+        New-Item -ItemType Directory -Force -Path "$Root\models\sr" | Out-Null
+        Get-RemoteFile 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth' "$Root\models\sr\realesr-general-x4v3.pth"
+    }
+}
+
 # --------------------------------------------------------------- CosyVoice
 # Candidate TTS evaluated for expressiveness (emotion instructions, streaming output).
 if ($Only -in 'all', 'cosyvoice') {

@@ -94,6 +94,7 @@ def main() -> None:
     parser.add_argument("--ref_lang", default="zh")
     parser.add_argument("--preset_voice", help="使用预置音色（不做声音克隆），给出音色名，例如 zf_001")
     parser.add_argument("--no_tts_streaming", action="store_true", help="语音整句合成完再输出")
+    parser.add_argument("--no_enhance", action="store_true", help="不做嘴部超分增强")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--pause", type=float, default=0.3, help="句间停顿秒数")
     parser.add_argument("--lead", type=float, default=0.3, help="新一句话的画面比当前播放位置提前多少秒开始排")
@@ -128,7 +129,9 @@ def main() -> None:
     loaders = [threading.Thread(target=tts.start), threading.Thread(target=llm.start)]
     for loader in loaders:
         loader.start()
-    lipsync = LipSyncEngine(root / "repos/MuseTalk", batch_size=args.batch_size)
+    enhance_weights = root / "models/sr/realesr-general-x4v3.pth"
+    lipsync = LipSyncEngine(root / "repos/MuseTalk", batch_size=args.batch_size,
+                            enhance_weights=None if args.no_enhance else enhance_weights)
     avatar = lipsync.load_avatar(Path(args.avatar).resolve(), closed_mouth=args.closed_mouth)
     for loader in loaders:
         loader.join()
@@ -262,6 +265,8 @@ def main() -> None:
         total_stall = sum(player.stats[n].stall_frames for n in player.stats) / FPS
         print(f"response latency: average {sum(latencies) / len(latencies):.2f}s, worst {max(latencies):.2f}s; "
               f"total stall while speaking {total_stall:.2f}s; dropped {len(dropped)} of {len(danmaku)}")
+    print(f"player: {player.frames_played} frames, {player.late_frames} more than one frame late, "
+          f"max lag behind clock {player.max_lag * 1000:.0f} ms")
     print("lipsync busy time: " + ", ".join(f"{name} {seconds:.1f}s" for name, seconds in lipsync.stats.items()))
     print(f"gpu memory peak: {peak_memory} MiB")
 

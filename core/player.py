@@ -78,6 +78,8 @@ class Player:
         self.stats: dict[int, ReplyStats] = {}
         self.error: BaseException | None = None
         self.frames_played = 0
+        self.late_frames = 0      # 出画面晚于时钟一帧以上的次数
+        self.max_lag = 0.0        # 出画面落后时钟的最大秒数
 
     @property
     def cursor(self) -> int:
@@ -154,5 +156,9 @@ class Player:
                 delay = next_tick - time.perf_counter()
                 if delay > 0:
                     time.sleep(delay)
+                else:
+                    self.max_lag = max(self.max_lag, -delay)  # 这一帧出晚了
+                    if -delay > 1 / self._fps:
+                        self.late_frames += 1
         except BaseException as error:  # 交给主线程报告
             self.error = error
