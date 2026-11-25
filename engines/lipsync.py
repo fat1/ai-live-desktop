@@ -43,9 +43,10 @@ class Avatar:
     masks: list[np.ndarray]        # 融合遮罩，单通道
     mask_coords: list              # 每帧遮罩裁剪框
     mask_bounds: list              # 每帧遮罩里非零区域的外接矩形 (x, y, 宽, 高)，裁剪框坐标
-    sharpen: float = 0.0           # 生成区域的锐化强度
-    closed_faces: np.ndarray | None = None  # 每帧对应的闭嘴人脸，用于待机
+    sharpen: float = 0.0           # 锐化强度；有 lip_weights 时只作用在嘴唇附近，否则作用在整个生成区域
+    closed_faces: list[np.ndarray] | None = None  # 每帧对应的闭嘴人脸，用于待机
     details: list[np.ndarray] | None = None  # 每帧人脸框内的原始皮肤纹理（高频细节），int8
+    lip_weights: list[np.ndarray] | None = None  # 每帧人脸框内的嘴唇权重图（即没有叠纹理的区域），uint8
 
     def __len__(self) -> int:
         return len(self.frames)
@@ -71,22 +72,36 @@ def _mouth_mask(mask: np.ndarray, face_box: tuple, crop_box: tuple) -> np.ndarra
     return (mask.astype(np.uint16) * ellipse // 255).astype(np.uint8)
 
 
-def _skin_detail(frame: np.ndarray, face_box: tuple) -> np.ndarray:
+def _lip_weight(width: int, height: int) -> np.ndarray:
+    """人脸框内的嘴唇权重图：嘴唇附近为 1，其余为 0，边缘羽化。
+
+    返回:
+        [高, 宽] 的 float32 数组
+    """
+    weight = np.zeros((height, width), np.float32)
+    cv2.ellipse(weight, (width // 2, round(0.78 * height)), (round(0.20 * width), round(0.06 * height)),
+                0, 0, 360, 1.0, -1)
+    return cv2.GaussianBlur(weight, (0, 0), 8.0)
+
+
+def _skin_detail(frame: np.ndarray, face_box: tuple, lip_weight: np.ndarray) -> np.ndarray:
     """提取人脸框内的皮肤纹理：原图减去它的模糊版本，嘴唇附近置零。
 
+    参数:
+        lip_weight: _lip_weight 的返回值
     返回:
         与人脸框同样大小的 int8 数组，可直接加到生成的人脸上
     """
     x1, y1, x2, y2 = face_box
-    width, height = x2 - x1, y2 - y1
     box = frame[y1:y2, x1:x2].astype(np.float32)
     # 模糊半径决定叠回多粗的细节：2 只有毛孔，7 左右能带回胡茬和细纹（对比图见技术方案）
     detail = box - cv2.GaussianBlur(box, (0, 0), 7.0)
-    weight = np.ones((height, width), np.float32)
-    cv2.ellipse(weight, (width // 2, round(0.78 * height)), (round(0.20 * width), round(0.06 * height)),
-                0, 0, 360, 0.0, -1)
-    weight = cv2.GaussianBlur(weight, (0, 0), 8.0)[:, :, None]
-    return np.clip(detail * weight, -127, 127).astype(np.int8)
+    return np.clip(detail * (1 - lip_weight[:, :, None]), -127, 127).astype(np.int8)
+
+
+def _to_bgr(image: torch.Tensor) -> np.ndarray:
+    """把 [批, 3, 高, 宽]、取值 0 到 1 的 RGB 张量转成 [批, 高, 宽, 3] 的 uint8 BGR 数组。"""
+    return (image.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1).flip(-1).cpu().numpy()
 
 
 class LipSyncEngine:
@@ -179,8 +194,19 @@ class LipSyncEngine:
         return chunks
 
     @torch.no_grad()
-    def _generate(self, avatar: Avatar, indices: list[int], audio_batch: torch.Tensor) -> np.ndarray:
-        """生成一批人脸。不足一批时补齐到固定大小再裁掉，避免 torch.compile 为新形状重新编译。"""
+    def _face_shape(self, face_box: tuple) -> tuple[int, int, int]:
+        """_generate 为某一帧产出的人脸图像形状 (高, 宽, 3)。"""
+        x1, y1, x2, y2 = face_box
+        return (y2 - y1, x2 - x1, 3) if self._enhancer is not None else (256, 256, 3)
+
+    @torch.no_grad()
+    def _generate(self, avatar: Avatar, indices: list[int], audio_batch: torch.Tensor) -> list[np.ndarray]:
+        """生成一批人脸。不足一批时补齐到固定大小再裁掉，避免 torch.compile 为新形状重新编译。
+
+        返回:
+            每帧一张 BGR 人脸。有超分时已缩放到该帧人脸框的大小，blend 直接使用；
+            没有超分时是模型原始的 256x256，由 blend 放大
+        """
         started = time.perf_counter()
         real = len(indices)
         latent_batch = avatar.latents[indices]
@@ -190,16 +216,23 @@ class LipSyncEngine:
             latent_batch = torch.cat([latent_batch, latent_batch[-1:].expand(pad, -1, -1, -1)])
         predicted = self._unet(latent_batch, self._timesteps, encoder_hidden_states=self._pe(audio_batch)).sample
         image = (self._vae.decode(predicted / self._scaling).sample / 2 + 0.5).clamp(0, 1)[:real]
-        if self._enhancer is not None:
-            # 下半张脸（嘴所在的一半）做 4 倍超分后缩到 2 倍，上半张脸直接放大 2 倍，拼成 512x512。
+        if self._enhancer is None:
+            faces = list(_to_bgr(image))
+        else:
+            # 下半张脸（嘴所在的一半）做 4 倍超分，上半张脸直接放大 4 倍，拼成 1024x1024。
             # 上半张脸最终不会被用到（融合遮罩只覆盖嘴和下巴），不值得花算力
             half = image.shape[2] // 2
-            lower = nn.functional.interpolate(self._enhancer(image[:, :, half:]).clamp(0, 1),
-                                              scale_factor=0.5, mode="area")
-            upper = nn.functional.interpolate(image[:, :, :half], scale_factor=2, mode="bilinear")
-            image = torch.cat([upper, lower], dim=2)
-        image = (image * 255).round().to(torch.uint8)
-        faces = image.permute(0, 2, 3, 1).flip(-1).cpu().numpy()  # RGB 转 BGR
+            lower = self._enhancer(image[:, :, half:]).clamp(0, 1)
+            upper = nn.functional.interpolate(image[:, :, :half], scale_factor=4, mode="bilinear")
+            image = torch.cat([upper, lower], dim=2).float()
+            # 从 4 倍结果一次缩放到每帧人脸框的大小。中间不再经过固定的 512x512，
+            # 少一次重采样；人脸框大于 512 时也不会先缩小再放大
+            faces = []
+            for position, index in enumerate(indices):
+                height, width, _ = self._face_shape(avatar.coords[index])
+                fitted = nn.functional.interpolate(image[position:position + 1], size=(height, width),
+                                                   mode="bicubic", antialias=True)
+                faces.append(_to_bgr(fitted)[0])
         self.stats["model"] += time.perf_counter() - started
         return faces
 
@@ -211,7 +244,8 @@ class LipSyncEngine:
             avatar_dir: MuseTalk 预处理输出的素材目录
             mouth_only: 只替换嘴和下巴一带，脸颊和鼻子保留原始画面。模型输出只有 256x256，
                 贴回大脸时要放大，替换范围越大，模糊的区域越明显
-            sharpen: 对放大后的生成区域做锐化的强度，0 表示不锐化；skin_detail 开启时不使用
+            sharpen: 锐化强度，0 表示不锐化。skin_detail 开启时只锐化嘴唇附近（那里不叠纹理，
+                否则是唯一没有任何增强的区域）；关闭时锐化整个生成区域
             skin_detail: 把原始帧里的皮肤纹理叠回生成区域。生成结果缺少毛孔、胡茬这类细节，
                 而这些细节近似随机噪声，位置差一点看不出来，直接取原图的即可。
                 嘴唇附近不叠（原图那里是闭着的嘴缝，叠上去会出现重影）
@@ -245,17 +279,24 @@ class LipSyncEngine:
             mask_bounds=[cv2.boundingRect(mask) for mask in masks],
         )
         if skin_detail:
-            avatar.details = [_skin_detail(frame, box) for frame, box in zip(avatar.frames, coords)]
+            lips = [_lip_weight(x2 - x1, y2 - y1) for x1, y1, x2, y2 in coords]
+            avatar.details = [_skin_detail(frame, box, lip) for frame, box, lip in zip(avatar.frames, coords, lips)]
+            avatar.lip_weights = [np.round(lip * 255).astype(np.uint8) for lip in lips]
         if closed_mouth:
+            # 每帧人脸大小可能不同，缓存成一个拉平的一维数组，读取时按各帧的形状切开。
+            # 旧格式的缓存长度对不上，会自动重算并覆盖
             cache = avatar_dir / ("closed_faces_sr.npy" if self._enhancer is not None else "closed_faces.npy")
-            if cache.exists() and len(faces := np.load(cache)) == len(avatar):
-                avatar.closed_faces = faces
+            shapes = [self._face_shape(box) for box in coords]
+            ends = np.cumsum([height * width * channels for height, width, channels in shapes])
+            if cache.exists() and len(flat := np.load(cache)) == ends[-1]:
+                avatar.closed_faces = [flat[end - np.prod(shape):end].reshape(shape)
+                                       for end, shape in zip(ends, shapes)]
             else:
                 avatar.closed_faces = self._closed_faces(avatar)
-                np.save(cache, avatar.closed_faces)
+                np.save(cache, np.concatenate([face.ravel() for face in avatar.closed_faces]))
         return avatar
 
-    def _closed_faces(self, avatar: Avatar) -> np.ndarray:
+    def _closed_faces(self, avatar: Avatar) -> list[np.ndarray]:
         """用静音驱动，算出素材每一帧对应的闭嘴人脸。
 
         静音的音频特征是固定的，输出只取决于素材帧，所以可以一次算完，之后待机不再占用显卡。
@@ -265,8 +306,8 @@ class LipSyncEngine:
         faces = []
         for begin in range(0, len(avatar), self.batch_size):
             indices = list(range(begin, min(begin + self.batch_size, len(avatar))))
-            faces.append(self._generate(avatar, indices, feature.expand(len(indices), -1, -1)))
-        return np.concatenate(faces)
+            faces.extend(self._generate(avatar, indices, feature.expand(len(indices), -1, -1)))
+        return faces
 
     def stream(self, avatar: Avatar, sample_rate: int, start_index: int = 0) -> "SentenceStream":
         """开始为一句话增量生成画面，见 SentenceStream。"""
@@ -313,22 +354,26 @@ class LipSyncEngine:
         fx1, fy1 = min(xs + bx + bw, x2, width), min(ys + by + bh, y2, height)
         if fx1 <= fx0 or fy1 <= fy0:
             return frame
-        # 生成的人脸要缩放到人脸框大小：放大用 Lanczos（比默认的双线性清晰），缩小用区域平均
-        shrink = face.shape[0] >= y2 - y1 and face.shape[1] >= x2 - x1
-        enlarged = cv2.resize(face, (x2 - x1, y2 - y1),
+        # 有超分时人脸已经是人脸框的大小；否则要缩放：放大用 Lanczos（比默认的双线性清晰），缩小用区域平均
+        if face.shape[:2] != (y2 - y1, x2 - x1):
+            shrink = face.shape[0] >= y2 - y1 and face.shape[1] >= x2 - x1
+            face = cv2.resize(face, (x2 - x1, y2 - y1),
                               interpolation=cv2.INTER_AREA if shrink else cv2.INTER_LANCZOS4)
-        part = enlarged[fy0 - y1:fy1 - y1, fx0 - x1:fx1 - x1]
+        rows, cols = slice(fy0 - y1, fy1 - y1), slice(fx0 - x1, fx1 - x1)
+        part = face[rows, cols].astype(np.float32)
+        if avatar.sharpen > 0:
+            # 有嘴唇权重图时只锐化嘴唇附近，其余区域的细节由下面叠回的皮肤纹理提供
+            strength = avatar.sharpen
+            if avatar.lip_weights is not None:
+                strength = avatar.lip_weights[index][rows, cols, None] * np.float32(avatar.sharpen / 255)
+            part += (part - cv2.GaussianBlur(part, (0, 0), 2.0)) * strength
         if avatar.details is not None:
             # 叠回原始帧的皮肤纹理，见 load_avatar 的 skin_detail 参数
-            detail = avatar.details[index][fy0 - y1:fy1 - y1, fx0 - x1:fx1 - x1]
-            part = np.clip(part.astype(np.int16) + detail, 0, 255).astype(np.uint8)
-        elif avatar.sharpen > 0:
-            soft = cv2.GaussianBlur(part, (0, 0), 2.0)
-            part = cv2.addWeighted(part, 1 + avatar.sharpen, soft, -avatar.sharpen, 0)
+            part += avatar.details[index][rows, cols]
+        part = np.clip(part + 0.5, 0, 255).astype(np.uint16)
         region = frame[fy0:fy1, fx0:fx1]
         mask = avatar.masks[index][fy0 - ys:fy1 - ys, fx0 - xs:fx1 - xs, None].astype(np.uint16)
-        region[:] = ((part.astype(np.uint16) * mask + region.astype(np.uint16) * (255 - mask) + 127) // 255
-                     ).astype(np.uint8)
+        region[:] = ((part * mask + region.astype(np.uint16) * (255 - mask) + 127) // 255).astype(np.uint8)
         return frame
 
 
