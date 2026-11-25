@@ -5,6 +5,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 
@@ -65,6 +66,38 @@ class LlmServer:
 
     def __exit__(self, *exc_info) -> None:
         self.stop()
+
+    def chat_stream(self, system_prompt: str, user_message: str, max_tokens: int = 160,
+                    temperature: float = 0.7) -> Iterator[str]:
+        """流式生成回复，边生成边产出文本片段。
+
+        参数同 chat。
+        返回:
+            逐个产出新增的文本片段
+        抛出:
+            urllib.error.URLError: 服务不可达
+        """
+        body = json.dumps({
+            "messages": [{"role": "system", "content": system_prompt},
+                         {"role": "user", "content": user_message}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }).encode("utf-8")
+        request = urllib.request.Request(f"{self.url}/v1/chat/completions", data=body,
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            for raw_line in response:  # 服务端按 SSE 格式逐行返回 "data: {...}"
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                delta = json.loads(payload)["choices"][0]["delta"].get("content")
+                if delta:
+                    yield delta
 
     def chat(self, system_prompt: str, user_message: str, max_tokens: int = 160,
              temperature: float = 0.7) -> str:
